@@ -1,0 +1,120 @@
+## Документация и Примери за Тестване с Postman
+
+**Общи настройки:**
+*   Уверете се, че вашият Node.js сървър работи.
+*   Заменете `YOUR_PORT` с порта, на който работи сървърът (по подразбиране 3000).
+*   Заменете `YOUR_USER_ID` с реален идентификатор на потребител.
+*   Заменете `YOUR_IMAGE_KEY` с реален ключ на изображение в R2 (напр. `user123/photo.jpg`).
+
+---
+
+### 1. Качване на Изображения
+
+*   **Ендпойнт:** `POST /upload`
+*   **Описание:** Качва едно или повече изображения за даден потребител.
+*   **Метод:** `POST`
+*   **URL:** `http://localhost:YOUR_PORT/upload`
+*   **Body:**
+    *   Тип: `form-data`
+    *   Полета:
+        *   `userId` (text): `YOUR_USER_ID` (напр. `user123`)
+        *   `imageFiles` (file): Изберете един или повече файлове от вашия компютър. Postman позволява да добавите няколко файла към едно и също `file` поле, ако е конфигурирано да приема масив.
+*   **Примерен cURL (за един файл):**
+    ```bash
+    curl --location --request POST 'http://localhost:YOUR_PORT/upload' \
+    --form 'userId="user123"' \
+    --form 'imageFiles=@"/path/to/your/image.jpg"'
+    ```
+*   **Успешен Отговор (200 OK):**
+    *   `Content-Type: application/json`
+    *   Тяло:
+        ```json
+        {
+          "success": true,
+          "uploadedFiles": [
+            {
+              "originalName": "image1.jpg",
+              "key": "user123/image1.jpg",
+              "userId": "user123"
+            },
+            {
+              "originalName": "image2.png",
+              "key": "user123/image2.png",
+              "userId": "user123"
+            }
+            // ... и т.н. за всеки качен файл
+          ]
+        }
+        ```
+*   **Възможни Грешки:**
+    *   **400 Bad Request:**
+        *   Ако `userId` липсва: `{"error": "userId is required in the request body."}`
+        *   Ако не са прикачени файлове: `{"error": "No files uploaded."}`
+    *   **500 Internal Server Error:**
+        *   Ако `R2_BUCKET_NAME` не е конфигуриран: `{"error": "Server configuration error: Bucket name not set."}`
+        *   При други грешки при качване: `{"error": "Failed to upload image(s)", "details": "..."}`
+
+---
+
+### 2. Изтегляне на Всички Изображения за Потребител (и последващо изтриване)
+
+*   **Ендпойнт:** `GET /images/:userId`
+*   **Описание:** Извлича всички изображения за даден потребител като Base64 кодирани низове в JSON масив. След успешно изпращане на отговора, изображенията се изтриват от R2.
+*   **Метод:** `GET`
+*   **URL:** `http://localhost:YOUR_PORT/images/YOUR_USER_ID` (напр. `http://localhost:3000/images/user123`)
+*   **Примерен cURL:**
+    ```bash
+    curl --location --request GET 'http://localhost:YOUR_PORT/images/user123'
+    ```
+*   **Успешен Отговор (200 OK):**
+    *   `Content-Type: application/json`
+    *   Тяло:
+        ```json
+        [
+          {
+            "filename": "image1.jpg",
+            "contentType": "image/jpeg",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAUA..." // Дълъг Base64 низ
+          },
+          {
+            "filename": "image2.png",
+            "contentType": "image/png",
+            "data": "R0lGODlhAQABAIAAAAUEBAAAACwAAAAA..." // Дълъг Base64 низ
+          }
+        ]
+        ```
+        *(Postman ще покаже този JSON като текст. За визуализация, клиентско приложение трябва да използва Base64 данните, за да конструира Data URL.)*
+*   **Възможни Грешки:**
+    *   **404 Not Found:**
+        *   Ако няма изображения за потребителя: `{"message": "No images found for user YOUR_USER_ID."}`
+    *   **500 Internal Server Error:**
+        *   Ако `R2_BUCKET_NAME` не е конфигуриран: `{"error": "Server configuration error: Bucket name not set."}`
+        *   При други грешки при извличане: `{"error": "Failed to retrieve or process images.", "details": "..."}`
+
+---
+
+### 3. Изтегляне на Сурови Данни на Единично Изображение (за директна визуализация)
+
+*   **Ендпойнт:** `GET /image/raw/:key(*)`
+*   **Описание:** Извлича суровите бинарни данни на единично изображение по неговия пълен ключ. Полезно за директна визуализация в Postman или браузър. **Този ендпойнт НЕ изтрива файла.**
+*   **Метод:** `GET`
+*   **URL:** `http://localhost:YOUR_PORT/image/raw/YOUR_IMAGE_KEY` (напр. `http://localhost:3000/image/raw/user123/image1.jpg`)
+    *   Забележка: `YOUR_IMAGE_KEY` трябва да е пълният път, включително `userId/`.
+*   **Примерен cURL:**
+    ```bash
+    curl --location --request GET 'http://localhost:YOUR_PORT/image/raw/user123/image1.jpg' --output downloaded_image.jpg
+    ```
+*   **Успешен Отговор (200 OK):**
+    *   `Content-Type`: Типът на изображението (напр. `image/jpeg`, `image/png`)
+    *   Тяло: Суровите бинарни данни на изображението.
+        *(Postman трябва автоматично да визуализира изображението, ако разпознае Content-Type.)*
+*   **Възможни Грешки:**
+    *   **400 Bad Request:**
+        *   Ако ключът липсва: `{"error": "Image key is required."}`
+    *   **404 Not Found:**
+        *   Ако изображение с такъв ключ не съществува: Текстов отговор `Image with key YOUR_IMAGE_KEY not found.`
+    *   **500 Internal Server Error:**
+        *   Ако `R2_BUCKET_NAME` не е конфигуриран: `{"error": "Server configuration error: Bucket name not set."}`
+        *   При други грешки при извличане: `{"error": "Failed to retrieve image.", "details": "..."}`
+
+---
