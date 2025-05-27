@@ -79,6 +79,7 @@ const express = require('express');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
 const dotenv = require('dotenv');
 const multer = require('multer');
+const { Pool } = require('pg'); // Импортиране на pg Pool
 
 // Зареждане на променливи от .env файл (напр. R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY и др.)
 dotenv.config();
@@ -87,6 +88,15 @@ dotenv.config();
 const app = express();
 // Middleware за парсване на JSON тела на заявки
 app.use(express.json());
+
+// Конфигуриране на PostgreSQL Pool
+const pgPool = new Pool({
+  user: process.env.PGUSER, // Потребител за базата данни
+  host: process.env.PGHOST, // Хост на базата данни
+  database: process.env.PGDATABASE, // Име на базата данни
+  password: process.env.PGPASSWORD, // Парола за базата данни
+  port: parseInt(process.env.PGPORT, 10), // Порт на базата данни
+});
 
 // Конфигуриране на S3 клиента за връзка с Cloudflare R2
 const s3Client = new S3Client({
@@ -323,6 +333,66 @@ app.get('/image/raw/:key(*)', async (req, res) => {
         res.status(500).json({ error: 'Failed to retrieve image.', details: error.message });
       }
     }
+  }
+});
+
+/**
+ * @route POST /jobs
+ * @description Ендпойнт за създаване на нова задача (job) в PostgreSQL базата данни.
+ * Очаква JSON тяло със следните полета:
+ * - userId (string, задължително)
+ * - input_image_prompt (string, опционално)
+ * - input_image_style1 (string[], опционално, масив от стрингове)
+ * - input_image_style2 (string[], опционално, масив от стрингове)
+ * - input_image_url (string, опционално)
+ * - parameters (object, опционално, JSON обект)
+ */
+app.post('/jobs', async (req, res) => {
+  const {
+    userId,
+    input_image_prompt,
+    input_image_style1,
+    input_image_style2,
+    input_image_url,
+    parameters
+  } = req.body;
+
+  // Валидация на задължителните полета
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required.' });
+  }
+
+  // Статусът по подразбиране за нова задача е 'pending'
+  const status = 'pending';
+
+  // Подготовка на стойностите за заявката, като се обработват опционалните полета
+  // За масиви, ако са празни или undefined, ще се запишат като празни масиви в PostgreSQL (TEXT[])
+  // За JSONB, ако е undefined, ще се запише като NULL или празен обект, в зависимост от предпочитанията
+  const queryValues = [
+    userId, // $1
+    input_image_prompt || null, // $2  
+    input_image_url || null, // $3
+    status, // $4
+    parameters || {} // $5 (PostgreSQL JSONB)
+  ];
+
+  const insertQuery = `
+    INSERT INTO jobs2 (user_id, input_image_prompt, input_image_url, status, parameters)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING job_id; -- Връща ID-то на новосъздадения запис
+  `;
+
+  try {
+    const result = await pgPool.query(insertQuery, queryValues);
+    const newJobId = result.rows[0]?.job_id;
+    res.status(201).json({ 
+        success: true, 
+        message: 'Job created successfully.', 
+        jobId: newJobId 
+    });
+  } catch (error) {
+    console.error('Error creating job in PostgreSQL:', error);
+    res.status(500).json({ error: 'Failed to create job.', details: error.message });
   }
 });
 
