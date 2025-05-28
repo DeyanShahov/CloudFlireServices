@@ -79,7 +79,8 @@ const express = require('express');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
 const dotenv = require('dotenv');
 const multer = require('multer');
-const { Pool } = require('pg'); // Импортиране на pg Pool
+const amqp = require('amqplib'); // Импортиране на amqplib за RabbitMQ
+const { Pool, Connection } = require('pg'); // Импортиране на pg Pool
 
 // Зареждане на променливи от .env файл (напр. R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY и др.)
 dotenv.config();
@@ -88,6 +89,60 @@ dotenv.config();
 const app = express();
 // Middleware за парсване на JSON тела на заявки
 app.use(express.json());
+
+// --- RabbitMQ Конфигурация и Свързване ---
+const RABBITMQ_URL = process.env.RABBITMQ_URL; // Стандартен AMQP порт, 15672 е за management UI
+const RABBITMQ_CLIENT_PROVIDED_NAME = process.env.RABBITMQ_CLIENT_PROVIDED_NAME; // Име на клиента, което ще се показва в RabbitMQ UI
+const RABBITMQ_EXCHANGE_NAME = process.env.RABBITMQ_EXCHANGE_NAME; // Име на exchange-а, по подразбиране
+const RABBITMQ_EXCHANGE_TYPE = process.env.RABBITMQ_EXCHANGE_TYPE; // Тип на exchange-а
+const RABBITMQ_ROUTING_KEY = process.env.RABBITMQ_ROUTING_KEY; // Routing key за свързване на exchange-а с queue-то
+const RABBITMQ_QUEUE_NAME = process.env.RABBITMQ_QUEUE_NAME; // Име на queue-то, което ще се използва
+
+// Проверка дали всички необходими RabbitMQ променливи са зададени
+if (!RABBITMQ_URL || !RABBITMQ_CLIENT_PROVIDED_NAME || !RABBITMQ_EXCHANGE_NAME || !RABBITMQ_EXCHANGE_TYPE || !RABBITMQ_ROUTING_KEY || !RABBITMQ_QUEUE_NAME) {
+    console.error('RabbitMQ configuration is incomplete. Please check your .env file.');
+    process.exit(1);
+}
+
+
+let rabbitmqChannel = null;
+let rabbitmqConnection = null;
+
+async function connectRabbitMQ() {
+    try {
+        console.log('Attempting to connect to RabbitMQ...');
+        rabbitmqConnection = await amqp.connect(RABBITMQ_URL, { clientProperties: { connection_name: RABBITMQ_CLIENT_PROVIDED_NAME } });
+        console.log('Successfully connected to RabbitMQ.');
+
+        rabbitmqConnection.on('error', (err) => {
+            console.error('RabbitMQ connection error:', err.message);
+            rabbitmqChannel = null; // Нулиране на канала
+            // Опит за повторно свързване след известно време
+        });
+
+        rabbitmqConnection.on('close', () => {
+            console.warn('RabbitMQ connection closed. Attempting to reconnect in 5 seconds...');
+            rabbitmqChannel = null;
+            rabbitmqConnection = null;
+            setTimeout(connectRabbitMQ, 5000);
+        });
+
+        rabbitmqChannel = await rabbitmqConnection.createChannel();
+        await rabbitmqChannel.assertExchange(RABBITMQ_EXCHANGE_NAME, RABBITMQ_EXCHANGE_TYPE, { durable: true });
+        await rabbitmqChannel.assertQueue(RABBITMQ_QUEUE_NAME, { durable: true });
+        await rabbitmqChannel.bindQueue(RABBITMQ_QUEUE_NAME, RABBITMQ_EXCHANGE_NAME, RABBITMQ_ROUTING_KEY);
+        console.log('RabbitMQ channel, exchange, queue, and binding are set up.');
+    } catch (error) {
+        console.error('Failed to connect to RabbitMQ or setup channel:', error.message);
+        rabbitmqChannel = null;
+        rabbitmqConnection = null;
+        console.log('Retrying RabbitMQ connection in 5 seconds...');
+        setTimeout(connectRabbitMQ, 5000); // Опит за повторно свързване след 5 секунди
+    }
+}
+
+// Инициализиране на връзката с RabbitMQ при стартиране на приложението
+connectRabbitMQ();
 
 // Конфигуриране на PostgreSQL Pool
 const pgPool = new Pool({
@@ -371,25 +426,59 @@ app.post('/jobs', async (req, res) => {
   const queryValues = [
     userId, // $1
     input_image_prompt || null, // $2  
-    input_image_url || null, // $3
-    status, // $4
-    parameters || {} // $5 (PostgreSQL JSONB)
+    input_image_style1 && input_image_style1.length > 0 ? input_image_style1 : null, // $3 (PostgreSQL TEXT[])
+    input_image_style2 && input_image_style2.length > 0 ? input_image_style2 : null, // $4 (PostgreSQL TEXT[])
+    input_image_url || null, // $5
+    status, // $6
+    parameters || {} // $7 (PostgreSQL JSONB)
   ];
 
   const insertQuery = `
-    INSERT INTO jobs2 (user_id, input_image_prompt, input_image_url, status, parameters)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO jobs2 (user_id, input_image_prompt, input_image_style1, input_image_style2, input_image_url, status, parameters)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING job_id; -- Връща ID-то на новосъздадения запис
   `;
 
   try {
     const result = await pgPool.query(insertQuery, queryValues);
     const newJobId = result.rows[0]?.job_id;
-    res.status(201).json({ 
-        success: true, 
-        message: 'Job created successfully.', 
-        jobId: newJobId 
-    });
+    // res.status(201).json({ 
+    //     success: true, 
+    //     message: 'Job created successfully.', 
+    //     jobId: newJobId 
+    // });
+
+    if (newJobId) {
+      // Изпращане на съобщение към RabbitMQ след успешен запис в PostgreSQL
+      if (rabbitmqChannel) {
+        const messagePayload = {
+          job_id: newJobId,
+          input_image_prompt: input_image_prompt || null,
+          input_image_style1: input_image_style1 && input_image_style1.length > 0 ? input_image_style1 : null,
+          input_image_style2: input_image_style2 && input_image_style2.length > 0 ? input_image_style2 : null,
+        };
+        try {
+          rabbitmqChannel.publish(
+            RABBITMQ_EXCHANGE_NAME,
+            RABBITMQ_ROUTING_KEY,
+            Buffer.from(JSON.stringify(messagePayload)),
+            { persistent: true } // Гарантира, че съобщението ще оцелее при рестарт на RabbitMQ сървъра
+          );
+          console.log(`Message sent to RabbitMQ for job_id: ${newJobId}`);
+        } catch (rabbitError) {
+          console.error(`Failed to send message to RabbitMQ for job_id: ${newJobId}`, rabbitError);
+          // Тук може да се добави логика за обработка на грешката при изпращане към RabbitMQ,
+          // например, маркиране на задачата като "pending_notification" или опит за повторно изпращане.
+        }
+      } else {
+        console.warn(`Job ${newJobId} created, but RabbitMQ channel is not available. Message not sent.`);
+      }
+      res.status(201).json({ success: true, message: 'Job created successfully.', jobId: newJobId });
+    } else {
+      // Това не би трябвало да се случи, ако заявката е успешна и RETURNING работи
+      res.status(500).json({ error: 'Failed to create job or retrieve job ID.' });
+    }
+
   } catch (error) {
     console.error('Error creating job in PostgreSQL:', error);
     res.status(500).json({ error: 'Failed to create job.', details: error.message });
@@ -401,3 +490,27 @@ app.post('/jobs', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 // Стартиране на сървъра
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// --- Грациозно спиране ---
+// async function gracefulShutdown() {
+//   console.log('Attempting to gracefully shut down...');
+
+//   if (rabbitmqConnection) {
+//     try {
+//       console.log('Closing RabbitMQ connection...');
+//       await rabbitmqConnection.close();
+//       console.log('RabbitMQ connection closed.');
+//     } catch (err) {
+//       console.error('Error closing RabbitMQ connection:', err.message);
+//     }
+//   }
+
+//   // Тук можете да добавите и затваряне на PostgreSQL pool-а, ако е необходимо
+//   // await pgPool.end();
+//   // console.log('PostgreSQL pool closed.');
+
+//   process.exit(0);
+// }
+
+// process.on('SIGINT', gracefulShutdown); // Прихващане на Ctrl+C
+// process.on('SIGTERM', gracefulShutdown); // Прихващане на сигнал за терминиране
