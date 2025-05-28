@@ -1,5 +1,6 @@
 // Импортиране на необходимите вградени модули на Node.js
 const fs = require('fs');
+const crypto = require('crypto'); // За генериране на UUID
 const path = require('path');
 const { execSync } = require('child_process'); // За синхронно изпълнение на команди
 
@@ -80,6 +81,7 @@ const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectsCommand, List
 const dotenv = require('dotenv');
 const multer = require('multer');
 const amqp = require('amqplib'); // Импортиране на amqplib за RabbitMQ
+const { createClient: createRedisClient } = require('redis'); // Импортиране на redis клиент
 const { Pool, Connection } = require('pg'); // Импортиране на pg Pool
 
 // Зареждане на променливи от .env файл (напр. R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY и др.)
@@ -87,6 +89,9 @@ dotenv.config();
 
 // Създаване на Express приложение
 const app = express();
+// Middleware за парсване на URL-encoded тела на заявки (за form-data, което не е файл)
+app.use(express.urlencoded({ extended: true }));
+
 // Middleware за парсване на JSON тела на заявки
 app.use(express.json());
 
@@ -143,6 +148,48 @@ async function connectRabbitMQ() {
 
 // Инициализиране на връзката с RabbitMQ при стартиране на приложението
 connectRabbitMQ();
+
+// --- Redis Конфигурация и Свързване ---
+const REDIS_URL = process.env.REDIS_URL; // напр. rediss://default:yourpassword@yourhost.upstash.io:port
+
+if (!REDIS_URL) {
+    console.warn('REDIS_URL is not defined in .env. Redis functionality will be unavailable.');
+}
+
+let redisClient = null;
+
+async function connectRedis() {
+    if (!REDIS_URL) {
+        console.warn('Cannot connect to Redis: REDIS_URL not set.');
+        return;
+    }
+    try {
+        console.log('Attempting to connect to Redis...');
+        redisClient = createRedisClient({
+            url: REDIS_URL
+        });
+
+        redisClient.on('error', (err) => {
+            console.error('Redis Client Error:', err);
+            // Клиентът на redis v4 автоматично ще опита да се свърже отново при определени грешки.
+            // Може да се наложи допълнителна логика тук в зависимост от типа грешка.
+        });
+
+        redisClient.on('connect', () => console.log('Connecting to Redis...'));
+        redisClient.on('ready', () => console.log('Successfully connected to Redis and client is ready.'));
+        redisClient.on('reconnecting', () => console.log('Reconnecting to Redis...'));
+
+        await redisClient.connect();
+    } catch (error) {
+        console.error('Failed to connect to Redis:', error.message);
+        redisClient = null; // Нулиране на клиента при неуспешна първоначална връзка
+        // Може да се добави логика за повторен опит тук, ако е необходимо,
+        // въпреки че клиентът има вградени механизми за повторно свързване.
+    }
+}
+
+// Инициализиране на връзката с Redis при стартиране на приложението
+connectRedis();
 
 // Конфигуриране на PostgreSQL Pool
 const pgPool = new Pool({
@@ -394,6 +441,7 @@ app.get('/image/raw/:key(*)', async (req, res) => {
 /**
  * @route POST /jobs
  * @description Ендпойнт за създаване на нова задача (job) в PostgreSQL базата данни.
+ * @description Създаване на нова задача (job) в RabbitMQ брокаера на данни.
  * Очаква JSON тяло със следните полета:
  * - userId (string, задължително)
  * - input_image_prompt (string, опционално)
@@ -401,6 +449,8 @@ app.get('/image/raw/:key(*)', async (req, res) => {
  * - input_image_style2 (string[], опционално, масив от стрингове)
  * - input_image_url (string, опционално)
  * - parameters (object, опционално, JSON обект)
+ * - При успешно създаване на job, се изпраща съобщение към RabbitMQ с детайли за задачата.
+ * @returns {object} JSON обект с информация за създадената задача, включително jobId.
  */
 app.post('/jobs', async (req, res) => {
   const {
@@ -485,6 +535,99 @@ app.post('/jobs', async (req, res) => {
   }
 });
 
+/**
+ * @route POST /jobsRedis
+ * @description Ендпойнт за създаване на нова задача (job) в Redis.
+ * Очаква JSON тяло със следните полета:
+ * - userId (string, задължително)
+ * - input_image_prompt (string, опционално)
+ * - input_image_style1 (string[], опционално, масив от стрингове)
+ * - input_image_style2 (string[], опционално, масив от стрингове)
+ * - input_image_url (string, опционално)
+ * - parameters (object, опционално, JSON обект)
+ * При успешно създаване на job в Redis, се изпраща съобщение към RabbitMQ с детайли за задачата.
+ * @returns {object} JSON обект с информация за създадената задача, включително jobId.
+ */
+app.post('/jobsRedis', async (req, res) => {
+    const {
+        userId,
+        input_image_prompt,
+        input_image_style1,
+        input_image_style2,
+        input_image_url,
+        parameters
+    } = req.body;
+
+    if (!userId) {
+        return res.status(400).json({ error: 'userId is required.' });
+    }
+
+    if (!redisClient || !redisClient.isReady) {
+        console.error('Redis client is not connected or not ready.');
+        return res.status(503).json({ error: 'Service unavailable: Redis connection error.' });
+    }
+
+    const jobId = crypto.randomUUID(); // Генериране на уникален ID за задачата
+    const status = 'pending';
+    const createdAt = new Date().toISOString();
+
+    const jobData = {
+        job_id: jobId,
+        user_id: userId,
+        input_image_prompt: input_image_prompt || null,
+        // За масиви и обекти е добре да ги JSON.stringify, ако ще се съхраняват като стрингове в Redis Hash полета
+        input_image_style1: input_image_style1 && input_image_style1.length > 0 ? JSON.stringify(input_image_style1) : null,
+        input_image_style2: input_image_style2 && input_image_style2.length > 0 ? JSON.stringify(input_image_style2) : null,
+        input_image_url: input_image_url || null,
+        status: status,
+        parameters: parameters ? JSON.stringify(parameters) : null,
+        created_at: createdAt
+    };
+
+    // Премахване на null полета, за да не се записват изрично в Redis, ако не е нужно
+    const jobDataToStore = Object.fromEntries(Object.entries(jobData).filter(([_, v]) => v !== null));
+
+    try {
+        const redisKey = `job:${jobId}`;
+        await redisClient.hSet(redisKey, jobDataToStore);
+        // Можете да зададете и TTL (време на живот) за ключа, ако задачите са временни
+        // await redisClient.expire(redisKey, 3600); // Например, изтича след 1 час
+
+        console.log(`Job ${jobId} created successfully in Redis.`);
+
+        // Изпращане на съобщение към RabbitMQ
+        if (rabbitmqChannel) {
+            const messagePayload = {
+                job_id: jobId,
+                input_image_prompt: input_image_prompt || null,
+                // За RabbitMQ изпращаме оригиналните масиви, не JSON стрингове
+                input_image_style1: input_image_style1 && input_image_style1.length > 0 ? input_image_style1 : null,
+                input_image_style2: input_image_style2 && input_image_style2.length > 0 ? input_image_style2 : null,
+            };
+            try {
+                rabbitmqChannel.publish(
+                    RABBITMQ_EXCHANGE_NAME,
+                    RABBITMQ_ROUTING_KEY,
+                    Buffer.from(JSON.stringify(messagePayload)),
+                    { persistent: true }
+                );
+                console.log(`Message sent to RabbitMQ for job_id: ${jobId}`);
+            } catch (rabbitError) {
+                console.error(`Failed to send message to RabbitMQ for job_id: ${jobId}`, rabbitError);
+                // Обмислете логика за компенсация или маркиране на задачата
+            }
+        } else {
+            console.warn(`Job ${jobId} created in Redis, but RabbitMQ channel is not available. Message not sent.`);
+        }
+
+        res.status(201).json({ success: true, message: 'Job created successfully in Redis.', jobId: jobId });
+
+    } catch (error) {
+        console.error('Error creating job in Redis:', error);
+        res.status(500).json({ error: 'Failed to create job in Redis.', details: error.message });
+    }
+});
+
 
 // Дефиниране на порта, на който сървърът ще слуша
 const PORT = process.env.PORT || 3000;
@@ -492,25 +635,42 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 // --- Грациозно спиране ---
-// async function gracefulShutdown() {
-//   console.log('Attempting to gracefully shut down...');
+async function gracefulShutdown() {
+  console.log('Attempting to gracefully shut down...');
 
-//   if (rabbitmqConnection) {
-//     try {
-//       console.log('Closing RabbitMQ connection...');
-//       await rabbitmqConnection.close();
-//       console.log('RabbitMQ connection closed.');
-//     } catch (err) {
-//       console.error('Error closing RabbitMQ connection:', err.message);
-//     }
-//   }
+  if (rabbitmqConnection) {
+    try {
+      console.log('Closing RabbitMQ connection...');
+      await rabbitmqConnection.close();
+      console.log('RabbitMQ connection closed.');
+    } catch (err) {
+      console.error('Error closing RabbitMQ connection:', err.message);
+    }
+  }
 
-//   // Тук можете да добавите и затваряне на PostgreSQL pool-а, ако е необходимо
-//   // await pgPool.end();
-//   // console.log('PostgreSQL pool closed.');
+  if (redisClient && redisClient.isReady) { // Проверка дали клиентът е свързан преди да се опитаме да го затворим
+    try {
+      console.log('Closing Redis connection...');
+      await redisClient.quit(); // или redisClient.disconnect() в зависимост от нуждите
+      console.log('Redis connection closed.');
+    } catch (err) {
+      console.error('Error closing Redis connection:', err.message);
+    }
+  }
 
-//   process.exit(0);
-// }
+  // Тук можете да добавите и затваряне на PostgreSQL pool-а, ако е необходимо
+  if (pgPool) {
+      try {
+        console.log('Closing PostgreSQL pool...');
+        await pgPool.end();
+        console.log('PostgreSQL pool closed.');
+      } catch (err) {
+        console.error('Error closing PostgreSQL pool:', err.message);
+      }
+  }
 
-// process.on('SIGINT', gracefulShutdown); // Прихващане на Ctrl+C
-// process.on('SIGTERM', gracefulShutdown); // Прихващане на сигнал за терминиране
+  process.exit(0);
+}
+
+process.on('SIGINT', gracefulShutdown); // Прихващане на Ctrl+C
+process.on('SIGTERM', gracefulShutdown); // Прихващане на сигнал за терминиране
