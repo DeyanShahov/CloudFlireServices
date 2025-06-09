@@ -191,6 +191,14 @@ async function connectRedis() {
 // Инициализиране на връзката с Redis при стартиране на приложението
 connectRedis();
 
+// --- Redis Set Имена за Статуси на Задачи ---
+const JOB_STATUS_PENDING = 'jobs:status:pending';
+// const JOB_STATUS_PROCESSING = 'jobs:status:processing'; // Управлява се от външен worker
+const JOB_STATUS_READY = 'jobs:status:ready'; // Задачи, готови за изтегляне от диспечера
+// const JOB_STATUS_FAILED = 'jobs:status:failed'; // Управлява се от външен worker
+const JOB_STATUS_DISPATCHER_CACHE_PROCESSING = 'jobs:status:dispatcher_cache_processing'; // Задачи, кеширани от диспечера и чакащи клиент
+
+
 // Конфигуриране на PostgreSQL Pool
 const pgPool = new Pool({
   user: process.env.PGUSER, // Потребител за базата данни
@@ -217,6 +225,13 @@ const upload = multer({
     storage: storage, // Файловете се съхраняват в паметта като Buffer обекти
     limits: { files: 10 } // Ограничение до 10 файла на заявка
 });
+
+// --- Диспечерски Механизъм за Готови Задачи ---
+const readyJobsForClientCache = new Map(); // Локален кеш: jobId -> { r2Key, userId, createdAt, expiresAt }
+const DISPATCHER_POLL_INTERVAL = parseInt(process.env.DISPATCHER_POLL_INTERVAL, 10) || 5000; // ms
+const DISPATCHER_CACHE_ITEM_TTL = parseInt(process.env.DISPATCHER_CACHE_ITEM_TTL, 10) || (60 * 60 * 1000); // 1 час по подразбиране
+
+let dispatcherIntervalId = null;
 
 /**
  * @async
@@ -587,13 +602,20 @@ app.post('/jobsRedis', async (req, res) => {
     // Премахване на null полета, за да не се записват изрично в Redis, ако не е нужно
     const jobDataToStore = Object.fromEntries(Object.entries(jobData).filter(([_, v]) => v !== null));
 
-    try {
-        const redisKey = `job:${jobId}`;
-        await redisClient.hSet(redisKey, jobDataToStore);
-        // Можете да зададете и TTL (време на живот) за ключа, ако задачите са временни
+    try {        
+        const redisKey = jobId;
+
+        // Използване на MULTI за атомарност на операциите
+        const multi = redisClient.multi();
+        multi.hSet(redisKey, jobDataToStore); // Запис на данните за задачата в Hash
+        multi.sAdd(JOB_STATUS_PENDING, jobId); // Добавяне на jobId към Set-а за pending задачи
+        
+        // Можете да зададете и TTL (време на живот) за самия Hash ключ, ако задачите са временни
         // await redisClient.expire(redisKey, 3600); // Например, изтича след 1 час
 
-        console.log(`Job ${jobId} created successfully in Redis.`);
+        await multi.exec();
+
+        console.log(`Job ${jobId} created successfully in Redis and added to '${JOB_STATUS_PENDING}'.`);
 
         // Изпращане на съобщение към RabbitMQ
         if (rabbitmqChannel) {
@@ -628,6 +650,196 @@ app.post('/jobsRedis', async (req, res) => {
     }
 });
 
+/**
+ * @route GET /jobResult/:jobId
+ * @description Ендпойнт за проверка на статуса на задача и извличане на резултата (изображение).
+ * Клиентите правят polling към този ендпойнт.
+ * @param {string} req.params.jobId - ID на задачата.
+ */
+app.get('/jobResult', async (req, res) => { // Промяна: премахване на :jobId от пътя
+    const { jobId } = req.query; // Промяна: извличане на jobId от req.query
+    const bucketName = process.env.R2_BUCKET_NAME;
+
+    if (!jobId) {
+        return res.status(400).json({ error: 'jobId query parameter is required.' });
+    }
+
+    if (!redisClient || !redisClient.isReady) {
+        return res.status(503).json({ error: 'Service unavailable: Redis connection error.' });
+    }
+    if (!bucketName) {
+        console.error('R2_BUCKET_NAME is not set in .env for /jobResult');
+        return res.status(500).json({ error: 'Server configuration error: Bucket name not set.' });
+    }
+
+    try {
+        // 1. Проверка в локалния кеш на диспечера
+        if (readyJobsForClientCache.has(jobId)) {
+            const jobCacheInfo = readyJobsForClientCache.get(jobId);
+            const r2Key = jobCacheInfo.r2Key;
+
+            console.log(`Job ${jobId} found in dispatcher cache. Fetching from R2 with key: ${r2Key}`);
+
+            const getParams = { Bucket: bucketName, Key: r2Key };
+            const objectData = await s3Client.send(new GetObjectCommand(getParams));
+            const imageBody = await streamToBuffer(objectData.Body);
+
+            // Кодиране на изображението в Base64 
+            const base64Data = imageBody.toString('base64');
+            const finalResponse  = {
+                status: "completed",
+                image_data_base64: base64Data,
+                image_type: "png" // Приемаме, че винаги е PNG
+            };    
+
+            res.status(200).json(finalResponse); // Изпращане на JSON отговор
+
+            // Почистване след успешно изпращане
+            readyJobsForClientCache.delete(jobId);
+            await redisClient.sRem(JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId);
+            // await redisClient.del(jobId); // НЕ изтриваме основния Hash, за да може да се провери отново по-късно
+            // НЕ изтриваме и от R2, според изискването
+            console.log(`Job ${jobId} delivered to client from cache. Cleaned from dispatcher cache and '${JOB_STATUS_DISPATCHER_CACHE_PROCESSING}'.`);
+            return;
+        }
+
+        // 2. Ако не е в кеша, проверка директно в Redis Hash
+        const jobData = await redisClient.hGetAll(jobId);
+
+        if (!jobData || Object.keys(jobData).length === 0) {
+            return res.status(404).json({ status: 'not_found', message: 'Job not found.' });
+        }
+
+        if (jobData.status === 'ready' && jobData.output_r2_key) {
+            console.log(`Job ${jobId} found with status 'ready' in Redis Hash (not in dispatcher cache). Fetching directly.`);
+            const r2Key = jobData.output_r2_key;
+
+            const getParams = { Bucket: bucketName, Key: r2Key };
+            const objectData = await s3Client.send(new GetObjectCommand(getParams));
+            const imageBody = await streamToBuffer(objectData.Body);
+
+            // Кодиране на изображението в Base64 
+            const base64Data = imageBody.toString('base64');
+            const finalResponse = {
+                status: "completed",
+                image_data_base64: base64Data,
+                image_type: "png" // Приемаме, че винаги е PNG
+            };
+            
+
+            res.status(200).json(finalResponse); // Изпращане на JSON отговор
+
+            // Почистване от потенциални "готови" списъци, ако е останал там
+            // НЕ изтриваме основния Hash или R2 файла
+            const multiClean = redisClient.multi();
+            multiClean.sRem(JOB_STATUS_READY, jobId);
+            multiClean.sRem(JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId);
+            await multiClean.exec();
+            console.log(`Job ${jobId} (direct fetch) delivered. Ensured removal from ready/dispatcher sets.`);
+            return;
+
+        } else if (jobData.status === 'pending' || jobData.status === 'processing') {
+            return res.status(202).json({ status: jobData.status, message: 'Job is still being processed.' });
+        } else if (jobData.status === 'failed') {
+            return res.status(200).json({ status: 'failed', message: jobData.error_message || 'Job processing failed.' });
+        } else {
+            return res.status(200).json({ status: 'unknown', message: 'Job status is unknown or output is not ready.' });
+        }
+
+    } catch (error) {
+        console.error(`Error processing /jobResult for ${jobId}:`, error);
+        if (!res.headersSent) {
+            if (error.name === 'NoSuchKey') {
+                res.status(404).json({ status: 'error', message: `Image for job ${jobId} not found in R2.` });
+            } else {
+                res.status(500).json({ status: 'error', message: 'Failed to retrieve job result.', details: error.message });
+            }
+        }
+    }
+});
+
+// --- Диспечерска Логика ---
+async function runDispatcherCycle() {
+    if (!redisClient || !redisClient.isReady) {
+        console.warn('Dispatcher: Redis client not ready. Skipping cycle.');
+        return;
+    }
+    // console.log('Dispatcher: Running cycle...');
+
+    try {
+        const jobIdsInReadySet = await redisClient.sMembers(JOB_STATUS_READY);
+
+        if (jobIdsInReadySet && jobIdsInReadySet.length > 0) {
+            console.log(`Dispatcher: Found ${jobIdsInReadySet.length} job(s) in '${JOB_STATUS_READY}' set. IDs: ${jobIdsInReadySet.join(', ')}`);
+        } else {
+            // Можете да добавите лог и за случаите, когато няма готови задачи, ако е необходимо
+            // console.log(`Dispatcher: No jobs found in '${JOB_STATUS_READY}' set during this cycle.`);
+        }
+        for (const jobId of jobIdsInReadySet) {
+            if (readyJobsForClientCache.has(jobId)) { // Вече е в локалния кеш
+                await redisClient.sMove(JOB_STATUS_READY, JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId); // Увери се, че е в правилния Set
+                continue;
+            }
+
+            const jobData = await redisClient.hGetAll(jobId);
+            if (jobData && jobData.status === 'ready' && jobData.output_r2_key) {
+                const moved = await redisClient.sMove(JOB_STATUS_READY, JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId);
+                if (moved) {
+                    readyJobsForClientCache.set(jobId, {
+                        r2Key: jobData.output_r2_key,
+                        userId: jobData.user_id,
+                        createdAt: Date.now(),
+                        expiresAt: Date.now() + DISPATCHER_CACHE_ITEM_TTL
+                    });
+                    console.log(`Dispatcher: Job ${jobId} moved from '${JOB_STATUS_READY}' to cache and '${JOB_STATUS_DISPATCHER_CACHE_PROCESSING}'.`);
+                } else {
+                     // Може да се случи, ако друг инстанс го е взел или статусът се е променил.
+                     // Ако вече е в JOB_STATUS_DISPATCHER_CACHE_PROCESSING, това е ОК.
+                    if (await redisClient.sIsMember(JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId) && !readyJobsForClientCache.has(jobId)) {
+                         readyJobsForClientCache.set(jobId, { // Добави в локалния кеш, ако липсва
+                            r2Key: jobData.output_r2_key, userId: jobData.user_id, createdAt: Date.now(), expiresAt: Date.now() + DISPATCHER_CACHE_ITEM_TTL
+                        });
+                    }
+                }
+            } else if (jobData && jobData.status !== 'ready') {
+                console.warn(`Dispatcher: Job ${jobId} in '${JOB_STATUS_READY}' but Hash status is '${jobData.status}'. Removing from '${JOB_STATUS_READY}'.`);
+                await redisClient.sRem(JOB_STATUS_READY, jobId);
+            } else if (!jobData || Object.keys(jobData).length === 0) {
+                console.warn(`Dispatcher: Job ${jobId} in '${JOB_STATUS_READY}' but no Hash data. Removing from '${JOB_STATUS_READY}'.`);
+                await redisClient.sRem(JOB_STATUS_READY, jobId);
+            }
+        }
+    } catch (error) {
+        console.error('Dispatcher: Error during cycle:', error);
+    }
+
+    // Почистване на локалния кеш от изтекли елементи
+    const now = Date.now();
+    for (const [jobId, jobDetails] of readyJobsForClientCache.entries()) {
+        if (now > jobDetails.expiresAt) {
+            try {
+                // Връщане обратно в JOB_STATUS_READY, за да може да бъде обработен отново или изтеглен директно
+                const movedBack = await redisClient.sMove(JOB_STATUS_DISPATCHER_CACHE_PROCESSING, JOB_STATUS_READY, jobId);
+                readyJobsForClientCache.delete(jobId);
+                if (movedBack) {
+                    console.log(`Dispatcher: Job ${jobId} TTL expired in cache, moved back to '${JOB_STATUS_READY}'.`);
+                } else {
+                     console.log(`Dispatcher: Job ${jobId} TTL expired in cache. Could not move from '${JOB_STATUS_DISPATCHER_CACHE_PROCESSING}' (maybe already fetched or not there).`);
+                }
+            } catch (err) {
+                console.error(`Dispatcher: Error during TTL cleanup for job ${jobId}:`, err);
+            }
+        }
+    }
+}
+
+// Промяна в connectRedis за стартиране на диспечера
+redisClient.on('ready', () => { // Преместено от connectRedis функцията, за да е сигурно, че redisClient е дефиниран
+    console.log('Successfully connected to Redis and client is ready.');
+    if (dispatcherIntervalId) clearInterval(dispatcherIntervalId);
+    dispatcherIntervalId = setInterval(runDispatcherCycle, DISPATCHER_POLL_INTERVAL);
+    console.log(`Dispatcher service started. Polling every ${DISPATCHER_POLL_INTERVAL / 1000} seconds.`);
+});
 
 // Дефиниране на порта, на който сървърът ще слуша
 const PORT = process.env.PORT || 3000;
@@ -637,6 +849,11 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // --- Грациозно спиране ---
 async function gracefulShutdown() {
   console.log('Attempting to gracefully shut down...');
+
+  if (dispatcherIntervalId) {
+    clearInterval(dispatcherIntervalId);
+    console.log('Dispatcher service stopped.');
+  }
 
   if (rabbitmqConnection) {
     try {
