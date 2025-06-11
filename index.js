@@ -557,20 +557,34 @@ app.post('/jobs', async (req, res) => {
     if (newJobId) {
       // Изпращане на съобщение към RabbitMQ след успешен запис в PostgreSQL
       if (rabbitmqChannel) {
-        const messagePayload = {
+        const baseMessagePayload = {
           job_id: newJobId,
           input_image_prompt: input_image_prompt || null,
           input_image_style1: input_image_style1 && input_image_style1.length > 0 ? input_image_style1 : null,
           input_image_style2: input_image_style2 && input_image_style2.length > 0 ? input_image_style2 : null,
         };
+
+        // Извличане на специфични параметри, ако съществуват в req.body.parameters
+        const extractedParams = {};
+        if (parameters) { // 'parameters' е от req.body
+            const parameterKeysToExtract = ['steps', 'cfg', 'sampler_name', 'scheduler', 'ckpt_name', 'negative_prompt', 'positive_prompt', 'batch_size'];
+            for (const key of parameterKeysToExtract) {
+                if (Object.prototype.hasOwnProperty.call(parameters, key)) {
+                    extractedParams[key] = parameters[key];
+                }
+            }
+        }
+
+        const finalMessagePayload = { ...baseMessagePayload, ...extractedParams };
+
         try {
           rabbitmqChannel.publish(
             RABBITMQ_EXCHANGE_NAME,
             RABBITMQ_ROUTING_KEY,
-            Buffer.from(JSON.stringify(messagePayload)),
+            Buffer.from(JSON.stringify(finalMessagePayload)),
             { persistent: true } // Гарантира, че съобщението ще оцелее при рестарт на RabbitMQ сървъра
           );
-          console.log(`Message sent to RabbitMQ for job_id: ${newJobId}`);
+          console.log(`Message sent to RabbitMQ for job_id: ${newJobId} with payload:`, finalMessagePayload);
         } catch (rabbitError) {
           console.error(`Failed to send message to RabbitMQ for job_id: ${newJobId}`, rabbitError);
           // Тук може да се добави логика за обработка на грешката при изпращане към RabbitMQ,
@@ -660,21 +674,35 @@ app.post('/jobsRedis', async (req, res) => {
 
         // Изпращане на съобщение към RabbitMQ
         if (rabbitmqChannel) {
-            const messagePayload = {
+            const baseMessagePayload = {
                 job_id: jobId,
                 input_image_prompt: input_image_prompt || null,
                 // За RabbitMQ изпращаме оригиналните масиви, не JSON стрингове
                 input_image_style1: input_image_style1 && input_image_style1.length > 0 ? input_image_style1 : null,
                 input_image_style2: input_image_style2 && input_image_style2.length > 0 ? input_image_style2 : null,
             };
+
+            // Извличане на специфични параметри, ако съществуват в req.body.parameters
+            const extractedParams = {};
+            if (parameters) { // 'parameters' е от req.body
+                const parameterKeysToExtract = ['steps', 'cfg_scale', 'sampler_name', 'scheduler', 'ckpt_name', 'negative_prompt', 'positive_prompt', 'batch_size'];
+                for (const key of parameterKeysToExtract) {
+                    if (Object.prototype.hasOwnProperty.call(parameters, key)) {
+                        extractedParams[key] = parameters[key];
+                    }
+                }
+            }
+
+            const finalMessagePayload = { ...baseMessagePayload, ...extractedParams };
+
             try {
                 rabbitmqChannel.publish(
                     RABBITMQ_EXCHANGE_NAME,
                     RABBITMQ_ROUTING_KEY,
-                    Buffer.from(JSON.stringify(messagePayload)),
+                    Buffer.from(JSON.stringify(finalMessagePayload)),
                     { persistent: true }
                 );
-                console.log(`Message sent to RabbitMQ for job_id: ${jobId}`);
+                console.log(`Message sent to RabbitMQ for job_id: ${jobId} with payload:`, finalMessagePayload);
             } catch (rabbitError) {
                 console.error(`Failed to send message to RabbitMQ for job_id: ${jobId}`, rabbitError);
                 // Обмислете логика за компенсация или маркиране на задачата
