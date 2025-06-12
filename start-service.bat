@@ -5,6 +5,8 @@ REM Променя текущата директория към тази, в к�
 cd /D "%~dp0"
 
 echo Starting Node.js service (CloudFlireServices)...
+echo Ensuring all Node.js packages are installed first...
+
 
 REM Стартиране на приложението чрез npm start (използва скрипта от package.json)
 npm start

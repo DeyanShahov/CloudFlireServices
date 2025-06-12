@@ -228,10 +228,26 @@ const upload = multer({
 
 // --- Диспечерски Механизъм за Готови Задачи ---
 const readyJobsForClientCache = new Map(); // Локален кеш: jobId -> { r2Key, userId, createdAt, expiresAt }
-const DISPATCHER_POLL_INTERVAL = parseInt(process.env.DISPATCHER_POLL_INTERVAL, 10) || 5000; // ms
+//const DISPATCHER_POLL_INTERVAL = parseInt(process.env.DISPATCHER_POLL_INTERVAL, 10) || 5000; // ms
 const DISPATCHER_CACHE_ITEM_TTL = parseInt(process.env.DISPATCHER_CACHE_ITEM_TTL, 10) || (60 * 60 * 1000); // 1 час по подразбиране
 
+// --- Конфигурация за режими на диспечера ---
+// Стойностите се четат от .env или се използват стойности по подразбиране
+const DISPATCHER_ACTIVE_POLL_INTERVAL = parseInt(process.env.DISPATCHER_ACTIVE_POLL_INTERVAL, 10) || 5000; // 5 секунди по подразбиране
+const DISPATCHER_IDLE_POLL_INTERVAL = parseInt(process.env.DISPATCHER_IDLE_POLL_INTERVAL, 10) || 60000; // 1 минута по подразбиране
+const DISPATCHER_ACTIVE_MODE_DURATION = parseInt(process.env.DISPATCHER_ACTIVE_MODE_DURATION, 10) || 30000; // 30 секунди по подразбиране
+
+
+// --- Състояние на диспечера ---
+let currentDispatcherPollInterval = DISPATCHER_ACTIVE_POLL_INTERVAL; // Първоначално стартира в активен режим
 let dispatcherIntervalId = null;
+let activityTimeoutId = null; // Таймер за връщане в IDLE режим
+let isDispatcherInActiveMode = false; // Флаг за текущия режим (ще стане true при първото активиране)
+
+// Декларираме runDispatcherCycle тук, за да може да се използва от функциите за управление на режимите,
+// преди нейната пълна дефиниция по-долу в кода.
+async function runDispatcherCycle() { /* ... тялото на функцията е дефинирано по-долу ... */ }
+
 
 /**
  * @async
@@ -245,8 +261,52 @@ const streamToBase64 = (stream) =>
     const chunks = [];
     stream.on("data", (chunk) => chunks.push(chunk));
     stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks).toString("base64")));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
   });
+
+function startOrRestartDispatcherInterval() {
+    if (dispatcherIntervalId) {
+        clearInterval(dispatcherIntervalId);
+        dispatcherIntervalId = null;
+    }
+    // Проверка дали redisClient е готов преди да стартираме интервала
+    if (redisClient && redisClient.isReady) {
+        dispatcherIntervalId = setInterval(runDispatcherCycle, currentDispatcherPollInterval);
+        // Логването за стартиране/смяна на интервала се случва във функциите за смяна на режим
+    } else {
+        console.warn('Dispatcher: Cannot start interval, Redis client not ready.');
+    }
+}
+
+function switchToIdleMode() {
+    // Преминаваме в Idle режим само ако сме били активни или интервалът не е вече Idle
+    if (isDispatcherInActiveMode || currentDispatcherPollInterval !== DISPATCHER_IDLE_POLL_INTERVAL) {
+        console.log(`Dispatcher: Switching to Idle Mode. Polling interval will be: ${DISPATCHER_IDLE_POLL_INTERVAL / 1000}s.`);
+        currentDispatcherPollInterval = DISPATCHER_IDLE_POLL_INTERVAL;
+        isDispatcherInActiveMode = false;
+        startOrRestartDispatcherInterval();
+    }
+    if (activityTimeoutId) {
+        clearTimeout(activityTimeoutId);
+        activityTimeoutId = null;
+    }
+}
+
+function activateWorkingMode() {
+    if (activityTimeoutId) { // Нулиране на предходен таймер за активност
+        clearTimeout(activityTimeoutId);
+    }
+
+    if (!isDispatcherInActiveMode || currentDispatcherPollInterval !== DISPATCHER_ACTIVE_POLL_INTERVAL) {
+        console.log(`Dispatcher: Switching to Active Mode. Polling interval will be: ${DISPATCHER_ACTIVE_POLL_INTERVAL / 1000}s.`);
+        currentDispatcherPollInterval = DISPATCHER_ACTIVE_POLL_INTERVAL;
+        isDispatcherInActiveMode = true;
+        startOrRestartDispatcherInterval();
+    }
+    console.log(`Dispatcher: Activity detected. Resetting active mode timer to ${DISPATCHER_ACTIVE_MODE_DURATION / 1000}s. Current mode: Active (polling every ${currentDispatcherPollInterval / 1000}s).`);
+    activityTimeoutId = setTimeout(switchToIdleMode, DISPATCHER_ACTIVE_MODE_DURATION);
+}
+
 
 /**
  * @async
@@ -711,6 +771,9 @@ app.post('/jobsRedis', async (req, res) => {
             console.warn(`Job ${jobId} created in Redis, but RabbitMQ channel is not available. Message not sent.`);
         }
 
+        // Активиране на "работещ" режим на диспечера, тъй като е създадена нова задача
+        activateWorkingMode();
+
         res.status(201).json({ success: true, message: 'Job created successfully in Redis.', jobId: jobId });
 
     } catch (error) {
@@ -743,22 +806,63 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
     }
 
     try {
-        let jobData = await redisClient.hGetAll(jobId); // Вземане на данните за задачата веднъж
+        // При всяка заявка за резултат, активираме "работещ" режим на диспечера
+        activateWorkingMode();
 
-        // Случай 1: Задачата не е намерена в Redis
-        if (!jobData || Object.keys(jobData).length === 0) {
-            // Проверка дали е била в кеша на диспечера (което предполага, че някога е съществувала)
-            if (readyJobsForClientCache.has(jobId)) {
-                console.warn(`Job ${jobId} was in dispatcher cache but not in Redis. Cleaning cache entry.`);
-                readyJobsForClientCache.delete(jobId);
+        let jobData = await redisClient.hGetAll(jobId); // Вземане на данните за задачата веднъж
+      
+        // --- Step 1: Check local cache first ---
+        const cachedJob = readyJobsForClientCache.get(jobId);
+
+        if (cachedJob && cachedJob.r2Key) {
+            console.log(`Job ${jobId}: Found in local dispatcher cache with R2 key: ${cachedJob.r2Key}. Attempting to fetch and send.`);
+            try {
+                const getParams = { Bucket: bucketName, Key: cachedJob.r2Key };
+                const objectData = await s3Client.send(new GetObjectCommand(getParams));
+                const imageBody = await streamToBuffer(objectData.Body);
+                const base64Data = imageBody.toString('base64');
+
+                const finalResponse = {
+                    status: "completed",
+                    image_data_base64: base64Data,
+                    image_type: objectData.ContentType || "application/octet-stream"
+                };
+
+                res.status(200).json(finalResponse);
+                console.log(`Job ${jobId} (R2 Key: ${cachedJob.r2Key}) from cache successfully sent to client.`);
+                // Cleanup after successful send from cache
+                await performFullCleanup(jobId, cachedJob.r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+            } catch (fetchError) {
+                if (fetchError.name === 'NoSuchKey') {
+                    console.warn(`Job ${jobId}: (From Cache) R2 object not found (NoSuchKey) for key ${cachedJob.r2Key}. Cleaning up job.`);
+                    if (!res.headersSent) {
+                        res.status(404).json({ status: 'error', message: `Image for job ${jobId} (key: ${cachedJob.r2Key}) not found in storage. The job record is being cleaned up.` });
+                    }
+                    await performFullCleanup(jobId, cachedJob.r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+                } else {
+                    console.error(`Job ${jobId}: (From Cache) Error fetching/processing image from R2 (Key: ${cachedJob.r2Key}):`, fetchError);
+                    if (!res.headersSent) {
+                        res.status(500).json({ status: 'error', message: 'Failed to retrieve image data from cache source due to storage error.', details: fetchError.message });
+                    }
+                    // DO NOT cleanup here for other R2 errors. Let client retry. Job stays in cache until TTL.
+                }
             }
-            return res.status(404).json({ status: 'not_found', message: 'Job not found.' });
+            return; // Important: exit after handling cached job
+        }
+       
+        // --- Step 2: If not in cache, or cache entry was invalid, query Redis ---
+        console.log(`Job ${jobId}: Not found in local cache or cache entry invalid. Querying Redis.`);
+        jobData = await redisClient.hGetAll(jobId); // Вземане на данните за задачата от Redis
+
+        // Case 1 (from Redis): Job not found in Redis
+        if (!jobData || Object.keys(jobData).length === 0) {
+            return res.status(404).json({ status: 'not_found', message: 'Job not found in Redis.' });
         }
 
-        // Случай 2: Задачата е 'ready' и има output_r2_key
-        if (jobData.status === 'ready' && jobData.output_r2_key) {
-            const r2Key = jobData.output_r2_key;
-            console.log(`Job ${jobId} is 'ready' with R2 key: ${r2Key}. Attempting to fetch and send.`);
+        // Case 2 (from Redis): Job is 'ready' and has output_r2_key
+        if (jobData.status === 'ready' && jobData.output_r2_key) { // NOSONAR
+            const r2Key = jobData.output_r2_key; // NOSONAR
+            console.log(`Job ${jobId}: Found in Redis as 'ready' with R2 key: ${r2Key}. Attempting to fetch and send.`);
             try {
                 const getParams = { Bucket: bucketName, Key: r2Key };
                 const objectData = await s3Client.send(new GetObjectCommand(getParams));
@@ -772,28 +876,32 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 };
 
                 res.status(200).json(finalResponse);
-                console.log(`Job ${jobId} (R2 Key: ${r2Key}) successfully sent to client.`);
+                console.log(`Job ${jobId} (R2 Key: ${r2Key}) from Redis successfully sent to client.`);
                 // Почистване след успешно изпращане
                 await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
             } catch (fetchError) {
                 if (fetchError.name === 'NoSuchKey') {
-                    console.warn(`Job ${jobId}: R2 object not found (NoSuchKey) for key ${r2Key}. Job status was 'ready'. Cleaning up job.`);
+                    console.warn(`Job ${jobId}: (From Redis) R2 object not found (NoSuchKey) for key ${r2Key}. Job status was 'ready'. Cleaning up job.`);
                     if (!res.headersSent) {
                         res.status(404).json({ status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.` });
                     }
-                    await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // r2Key е null, тъй като не е намерен
+                    // await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // r2Key е null, тъй като не е намерен
+                //} else {
+                    // console.error(`Job ${jobId}: Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
+                    await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
                 } else {
-                    console.error(`Job ${jobId}: Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
+                    console.error(`Job ${jobId}: (From Redis) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);                  
                     if (!res.headersSent) {
-                        res.status(500).json({ status: 'error', message: 'Failed to retrieve image data.', details: fetchError.message });
+                        res.status(500).json({ status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message });
                     }
+                    // DO NOT cleanup here for other R2 errors. Job remains 'ready' in Redis. Client can retry.
                     // При други грешки при извличане, може да не искаме да чистим веднага, за да позволим евентуален повторен опит или инспекция.
                 }
             }
             return;
         }
 
-        // Случай 3: Задачата е 'pending' или 'processing'
+        // Case 3 (from Redis): Job is 'pending' or 'processing'
         if (jobData.status === 'pending' || jobData.status === 'processing') {
             return res.status(202).json({ status: jobData.status, message: 'Job is still being processed.' });
         }
@@ -801,7 +909,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
         // Случай 4: Задачата е 'failed'
         if (jobData.status === 'failed') {
             res.status(200).json({ status: 'failed', message: jobData.error_message || 'Job processing failed.' });
-            console.log(`Job ${jobId}: Reported 'failed' status to client. Initiating cleanup.`);
+            console.log(`Job ${jobId}: Reported 'failed' status to client (from Redis). Initiating cleanup.`);
             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // Няма R2 ключ за неуспешни задачи
             return;
         }
@@ -910,12 +1018,10 @@ async function runDispatcherCycle() {
     }
 }
 
-// Промяна в connectRedis за стартиране на диспечера
+// Стартиране на диспечера, когато Redis е готов
 redisClient.on('ready', () => { // Преместено от connectRedis функцията, за да е сигурно, че redisClient е дефиниран
     console.log('Successfully connected to Redis and client is ready.');
-    if (dispatcherIntervalId) clearInterval(dispatcherIntervalId);
-    dispatcherIntervalId = setInterval(runDispatcherCycle, DISPATCHER_POLL_INTERVAL);
-    console.log(`Dispatcher service started. Polling every ${DISPATCHER_POLL_INTERVAL / 1000} seconds.`);
+    activateWorkingMode(); // Диспечерът стартира в "работещ" режим
 });
 
 // Дефиниране на порта, на който сървърът ще слуша
@@ -926,6 +1032,11 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // --- Грациозно спиране ---
 async function gracefulShutdown() {
   console.log('Attempting to gracefully shut down...');
+
+  if (activityTimeoutId) {
+    clearTimeout(activityTimeoutId);
+    console.log('Dispatcher activity timer cleared.');
+  }
 
   if (dispatcherIntervalId) {
     clearInterval(dispatcherIntervalId);
