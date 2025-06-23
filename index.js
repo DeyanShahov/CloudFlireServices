@@ -103,9 +103,18 @@ const RABBITMQ_EXCHANGE_TYPE = process.env.RABBITMQ_EXCHANGE_TYPE; // Тип н�
 const RABBITMQ_ROUTING_KEY = process.env.RABBITMQ_ROUTING_KEY; // Routing key за свързване на exchange-а с queue-то
 const RABBITMQ_QUEUE_NAME = process.env.RABBITMQ_QUEUE_NAME; // Име на queue-то, което ще се използва
 
+// --- НОВО: RabbitMQ Настройки за Услугата за Смяна на Облекло ---
+const RABBITMQ_OUTFIT_EXCHANGE_NAME = process.env.RABBITMQ_OUTFIT_EXCHANGE_NAME;
+const RABBITMQ_OUTFIT_ROUTING_KEY = process.env.RABBITMQ_OUTFIT_ROUTING_KEY;
+const RABBITMQ_OUTFIT_QUEUE_NAME = process.env.RABBITMQ_OUTFIT_QUEUE_NAME;
+
 // Проверка дали всички необходими RabbitMQ променливи са зададени
 if (!RABBITMQ_URL || !RABBITMQ_CLIENT_PROVIDED_NAME || !RABBITMQ_EXCHANGE_NAME || !RABBITMQ_EXCHANGE_TYPE || !RABBITMQ_ROUTING_KEY || !RABBITMQ_QUEUE_NAME) {
     console.error('RabbitMQ configuration is incomplete. Please check your .env file.');
+    process.exit(1);
+}
+if (!RABBITMQ_OUTFIT_EXCHANGE_NAME || !RABBITMQ_OUTFIT_ROUTING_KEY || !RABBITMQ_OUTFIT_QUEUE_NAME) {
+    console.error('RabbitMQ configuration for Outfit Change service is incomplete. Please check your .env file.');
     process.exit(1);
 }
 
@@ -136,7 +145,13 @@ async function connectRabbitMQ() {
         await rabbitmqChannel.assertExchange(RABBITMQ_EXCHANGE_NAME, RABBITMQ_EXCHANGE_TYPE, { durable: true });
         await rabbitmqChannel.assertQueue(RABBITMQ_QUEUE_NAME, { durable: true });
         await rabbitmqChannel.bindQueue(RABBITMQ_QUEUE_NAME, RABBITMQ_EXCHANGE_NAME, RABBITMQ_ROUTING_KEY);
-        console.log('RabbitMQ channel, exchange, queue, and binding are set up.');
+
+        // --- НОВО: Настройка на Exchange и Queue за Услугата за Смяна на Облекло ---
+        await rabbitmqChannel.assertExchange(RABBITMQ_OUTFIT_EXCHANGE_NAME, RABBITMQ_EXCHANGE_TYPE, { durable: true });
+        await rabbitmqChannel.assertQueue(RABBITMQ_OUTFIT_QUEUE_NAME, { durable: true });
+        await rabbitmqChannel.bindQueue(RABBITMQ_OUTFIT_QUEUE_NAME, RABBITMQ_OUTFIT_EXCHANGE_NAME, RABBITMQ_OUTFIT_ROUTING_KEY);
+
+        console.log('RabbitMQ channel, exchanges, queues, and bindings are set up.');
     } catch (error) {
         console.error('Failed to connect to RabbitMQ or setup channel:', error.message);
         rabbitmqChannel = null;
@@ -225,6 +240,18 @@ const upload = multer({
     storage: storage, // Файловете се съхраняват в паметта като Buffer обекти
     limits: { files: 10 } // Ограничение до 10 файла на заявка
 });
+
+// --- НОВО: Конфигурация на Multer за ендпойнта за смяна на облекло ---
+const uploadOutfitImages = multer({
+    storage: storage,
+    limits: { 
+        files: 2, // Максимум 2 файла общо
+        fileSize: 15 * 1024 * 1024 // Ограничение на размера на файла, напр. 15MB
+    } 
+}).fields([
+    { name: 'personImage', maxCount: 1 },
+    { name: 'garmentImage', maxCount: 1 }
+]);
 
 // --- Диспечерски Механизъм за Готови Задачи ---
 const readyJobsForClientCache = new Map(); // Локален кеш: jobId -> { r2Key, userId, createdAt, expiresAt }
@@ -325,28 +352,48 @@ const streamToBuffer = (stream) =>
 
 
 // Помощна функция за пълно почистване на данни за дадена задача
-async function performFullCleanup(jobId, r2Key, bucketName, redis, s3, localCache) {
+async function performFullCleanup(jobId, outputR2Key, bucketName, redis, s3, localCache) {
     try {
-        console.log(`Job ${jobId}: Initiating full cleanup. R2 Key (if any): ${r2Key}`);
+        console.log(`Job ${jobId}: Initiating full cleanup. Output R2 Key (if any): ${outputR2Key}`);
 
-        // 1. Изтриване от R2, ако е предоставен r2Key
-        if (r2Key && bucketName) {
+        const keysToDelete = [];
+        if (outputR2Key) {
+            keysToDelete.push({ Key: outputR2Key });
+        }
+
+        // Извличане на данните за задачата, за да намерим входните R2 ключове
+        const jobData = await redis.hGetAll(jobId);
+        if (jobData) {
+            // Проверка за ключове от услугата за смяна на облекло
+            if (jobData.person_image_r2_key) {
+                keysToDelete.push({ Key: jobData.person_image_r2_key });
+            }
+            if (jobData.garment_image_r2_key) {
+                keysToDelete.push({ Key: jobData.garment_image_r2_key });
+            }
+            // Тук могат да се добавят проверки и за други типове задачи с входни файлове в бъдеще
+        }
+
+        // 1. Групово изтриване от R2, ако има ключове за изтриване
+        if (keysToDelete.length > 0 && bucketName) {
             try {
                 const deleteR2Params = {
                     Bucket: bucketName,
-                    Delete: { Objects: [{ Key: r2Key }], Quiet: false }
+                    Delete: { Objects: keysToDelete, Quiet: false }
                 };
-                await s3.send(new DeleteObjectsCommand(deleteR2Params));
-                console.log(`Job ${jobId}: Successfully deleted R2 object: ${r2Key}`);
+                const deleteResult = await s3.send(new DeleteObjectsCommand(deleteR2Params));
+                console.log(`Job ${jobId}: Successfully requested deletion of ${deleteResult.Deleted?.length || 0} R2 objects.`);
+                if (deleteResult.Errors && deleteResult.Errors.length > 0) {
+                    console.error(`Job ${jobId}: Errors during R2 batch deletion:`, deleteResult.Errors);
+                }
             } catch (r2Error) {
-                console.error(`Job ${jobId}: Error deleting R2 object ${r2Key}:`, r2Error);
-                // Продължаваме с почистването на Redis, дори ако R2 изтриването е неуспешно
+                console.error(`Job ${jobId}: Error sending batch delete command to R2 for keys [${keysToDelete.map(k => k.Key).join(', ')}]:`, r2Error);
             }
         }
 
-        // 2. Изтриване от Redis (основния hash и всички релевантни status sets)
+        // 2. Изтриване от Redis
         const multi = redis.multi();
-        multi.del(jobId); // Изтриване на основния job hash
+        multi.del(jobId);
         multi.sRem(JOB_STATUS_PENDING, jobId); // В случай, че е заседнал
         multi.sRem(JOB_STATUS_READY, jobId);
         multi.sRem(JOB_STATUS_DISPATCHER_CACHE_PROCESSING, jobId);
@@ -354,13 +401,13 @@ async function performFullCleanup(jobId, r2Key, bucketName, redis, s3, localCach
         await multi.exec();
         console.log(`Job ${jobId}: Successfully deleted Redis hash and removed from status sets.`);
 
-        // 3. Изтриване от локалния кеш на диспечера
+        // 3. Изтриване от локалния кеш
         if (localCache.has(jobId)) {
             localCache.delete(jobId);
             console.log(`Job ${jobId}: Removed from dispatcher's local cache.`);
         }
     } catch (cleanupError) {
-        console.error(`Job ${jobId}: CRITICAL - Failed during full cleanup. R2 Key: ${r2Key}. Error:`, cleanupError);
+        console.error(`Job ${jobId}: CRITICAL - Failed during full cleanup. Output R2 Key: ${outputR2Key}. Error:`, cleanupError);
     }
 }
 
@@ -782,6 +829,112 @@ app.post('/jobsRedis', async (req, res) => {
     }
 });
 
+/**
+ * @route POST /jobChangeOutfit
+ * @description Ендпойнт за създаване на задача за смяна на облекло.
+ * Очаква multipart/form-data с полета:
+ * - userId (string, задължително)
+ * - personImage (file, задължително, изображение на човек)
+ * - garmentImage (file, задължително, изображение на дреха)
+ * - Всякакви други параметри се записват в Redis.
+ * Качва входните изображения в R2, създава задача в Redis и я публикува в RabbitMQ.
+ * @returns {object} JSON обект с jobId на създадената задача.
+ */
+app.post('/jobChangeOutfit', uploadOutfitImages, async (req, res) => {
+    const { userId, ...otherParams } = req.body;
+    const files = req.files;
+
+    // --- Валидация на входа ---
+    if (!userId) {
+        return res.status(400).json({ error: 'userId is required.' });
+    }
+    if (!files || !files.personImage || !files.garmentImage) {
+        return res.status(400).json({ error: 'Both personImage and garmentImage files are required.' });
+    }
+    if (!redisClient || !redisClient.isReady) {
+        return res.status(503).json({ error: 'Service unavailable: Redis connection error.' });
+    }
+    if (!rabbitmqChannel) {
+        return res.status(503).json({ error: 'Service unavailable: Message queue connection error.' });
+    }
+    const bucketName = process.env.R2_BUCKET_NAME;
+    if (!bucketName) {
+        console.error('R2_BUCKET_NAME is not set in .env');
+        return res.status(500).json({ error: 'Server configuration error: Bucket name not set.' });
+    }
+
+    const jobId = crypto.randomUUID();
+    const personImageFile = files.personImage[0];
+    const garmentImageFile = files.garmentImage[0];
+
+    // Генериране на уникални R2 ключове за входните изображения
+    const personImageR2Key = `jobs/${jobId}/input_person${path.extname(personImageFile.originalname) || '.jpg'}`;
+    const garmentImageR2Key = `jobs/${jobId}/input_garment${path.extname(garmentImageFile.originalname) || '.jpg'}`;
+
+    try {
+        // --- Качване на изображенията в R2 паралелно ---
+        console.log(`Job ${jobId}: Uploading input images to R2...`);
+        const uploadPromises = [
+            s3Client.send(new PutObjectCommand({
+                Bucket: bucketName,
+                Key: personImageR2Key,
+                Body: personImageFile.buffer,
+                ContentType: personImageFile.mimetype
+            })),
+            s3Client.send(new PutObjectCommand({
+                Bucket: bucketName,
+                Key: garmentImageR2Key,
+                Body: garmentImageFile.buffer,
+                ContentType: garmentImageFile.mimetype
+            }))
+        ];
+        await Promise.all(uploadPromises);
+        console.log(`Job ${jobId}: Successfully uploaded input images to R2.`);
+
+        // --- Създаване на задачата в Redis ---
+        const jobData = {
+            job_id: jobId,
+            type: 'outfit_change', // Тип на задачата
+            user_id: userId,
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            person_image_r2_key: personImageR2Key,
+            garment_image_r2_key: garmentImageR2Key,
+            // Записваме всички останали параметри, като ги превръщаме в стринг, ако са обекти
+            ...Object.fromEntries(Object.entries(otherParams).map(([key, value]) => 
+                [key, typeof value === 'object' ? JSON.stringify(value) : value]
+            ))
+        };
+
+        const multi = redisClient.multi();
+        multi.hSet(jobId, jobData);
+        multi.sAdd(JOB_STATUS_PENDING, jobId);
+        await multi.exec();
+        console.log(`Job ${jobId} (outfit_change) created in Redis and added to '${JOB_STATUS_PENDING}'.`);
+
+        // --- Публикуване на задачата в RabbitMQ ---
+        const message = JSON.stringify({ jobId }); // Изпращаме само ID-то
+        rabbitmqChannel.publish(
+            RABBITMQ_OUTFIT_EXCHANGE_NAME,
+            RABBITMQ_OUTFIT_ROUTING_KEY,
+            Buffer.from(message),
+            { persistent: true }
+        );
+        console.log(`Job ${jobId} published to RabbitMQ queue '${RABBITMQ_OUTFIT_QUEUE_NAME}'.`);
+
+        // Активиране на диспечера
+        activateWorkingMode();
+
+        // Връщане на успешен отговор
+        res.status(201).json({ success: true, message: 'Outfit change job created successfully.', jobId: jobId });
+
+    } catch (error) {
+        console.error(`Error creating outfit change job ${jobId}:`, error);
+        // Опит за почистване на вече качените файлове при грешка
+        await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache);
+        res.status(500).json({ error: 'Failed to create outfit change job.', details: error.message });
+    }
+});
 
 /**
  * @route GET /jobResult/:jobId
@@ -823,9 +976,13 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 const base64Data = imageBody.toString('base64');
 
                 const finalResponse = {
+                    success: true,
                     status: "completed",
-                    image_data_base64: base64Data,
-                    image_type: objectData.ContentType || "application/octet-stream"
+                    //image_data_base64: base64Data,
+                    //image_type: objectData.ContentType || "application/octet-stream"
+                    // Клиентът очаква imageUrls да е масив с base64 data URL
+                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+                    jobId: jobId // Добавено за консистентност
                 };
 
                 res.status(200).json(finalResponse);
@@ -856,7 +1013,51 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
 
         // Case 1 (from Redis): Job not found in Redis
         if (!jobData || Object.keys(jobData).length === 0) {
-            return res.status(404).json({ status: 'not_found', message: 'Job not found in Redis.' });
+           return res.status(404).json({ success: false, status: 'not_found', message: 'Job not found in Redis.', jobId: jobId });
+        }
+
+        // --- НОВО: Обработка на специфични междинни статуси от worker-и ---
+        const intermediateWorkerStatuses = ['waiting_comfyui']; // Добавете други подобни статуси тук, ако е необходимо
+        if (jobData.status && intermediateWorkerStatuses.includes(jobData.status)) {
+            console.log(`Job ${jobId}: Detected intermediate worker status '${jobData.status}'. Responding to client as 'processing'.`);
+            return res.status(200).json({ // Клиентът очаква 200 OK за успешни полинг отговори
+                success: true, // Ключово, за да може клиентът да продължи полинга
+                status: 'processing', // Или 'pending', клиентът обработва и двата за полинг
+                message: `Задачата е в междинен работен статус: ${jobData.status}. Обработката продължава.`,
+                jobId: jobId
+            });
+        }
+
+        // --- НОВО или КОРИГИРАНО: Обработка на статус 'completed' директно от Redis ---
+        // Този случай е нужен, ако worker-ите могат директно да зададат статус 'completed' в Redis
+        // и това означава, че output_r2_key също трябва да е наличен.
+        // Поставяме го преди 'ready', за да хванем 'completed' първо, ако е възможно.
+        if (jobData.status === 'completed' && jobData.output_r2_key) {
+            const r2Key = jobData.output_r2_key;
+            console.log(`Job ${jobId}: Status from Redis is 'completed' with R2 key ${r2Key}. Fetching from R2.`);
+            try {
+                // const getParams = { Bucket: bucketName, Key: r2Key }; // Redundant, getParams is defined below
+                const objectData = await s3Client.send(new GetObjectCommand({ Bucket: bucketName, Key: r2Key }));
+                const imageBody = await streamToBuffer(objectData.Body);
+                const base64Data = imageBody.toString('base64');
+
+                const finalResponse = {
+                    success: true,
+                    status: "completed", // Потвърждаваме за клиента
+                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+                    jobId: jobId
+                };
+                res.status(200).json(finalResponse);
+                console.log(`Job ${jobId} (R2 Key: ${r2Key}) from Redis 'completed' status successfully sent to client.`);
+                // Почистване след успешно изпращане
+                await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+                return; // Важно е да излезем от функцията тук
+            } catch (fetchError) {
+                console.error(`Job ${jobId}: (From Redis 'completed' status) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
+                // Връщаме грешка, но не изчистваме, за да може клиентът да опита отново или да се инспектира
+                res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data for completed job due to storage error.', details: fetchError.message, jobId: jobId });
+                return; // Важно е да излезем
+            }
         }
 
         // Case 2 (from Redis): Job is 'ready' and has output_r2_key
@@ -870,9 +1071,13 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 const base64Data = imageBody.toString('base64');
 
                 const finalResponse = {
+                    success: true, // Добавено за консистентност с очакванията на клиента
                     status: "completed",
-                    image_data_base64: base64Data,
-                    image_type: objectData.ContentType || "application/octet-stream" // Използване на реалния ContentType
+                    //image_data_base64: base64Data,
+                    // objectData.ContentType || "application/octet-stream" // Използване на реалния ContentType
+                    // Клиентът очаква imageUrls да е масив с base64 data URL
+                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+                    jobId: jobId // Добавено
                 };
 
                 res.status(200).json(finalResponse);
@@ -883,7 +1088,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 if (fetchError.name === 'NoSuchKey') {
                     console.warn(`Job ${jobId}: (From Redis) R2 object not found (NoSuchKey) for key ${r2Key}. Job status was 'ready'. Cleaning up job.`);
                     if (!res.headersSent) {
-                        res.status(404).json({ status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.` });
+                       res.status(404).json({ success: false, status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.`, jobId: jobId });
                     }
                     // await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // r2Key е null, тъй като не е намерен
                 //} else {
@@ -892,7 +1097,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 } else {
                     console.error(`Job ${jobId}: (From Redis) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);                  
                     if (!res.headersSent) {
-                        res.status(500).json({ status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message });
+                        res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message, jobId: jobId });
                     }
                     // DO NOT cleanup here for other R2 errors. Job remains 'ready' in Redis. Client can retry.
                     // При други грешки при извличане, може да не искаме да чистим веднага, за да позволим евентуален повторен опит или инспекция.
@@ -903,12 +1108,21 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
 
         // Case 3 (from Redis): Job is 'pending' or 'processing'
         if (jobData.status === 'pending' || jobData.status === 'processing') {
-            return res.status(202).json({ status: jobData.status, message: 'Job is still being processed.' });
+            return res.status(200).json({ // Клиентът очаква 200 OK
+                success: true, // Ключово
+                status: jobData.status,
+                message: 'Job is still being processed.',
+                jobId: jobId
+            });
         }
 
         // Случай 4: Задачата е 'failed'
         if (jobData.status === 'failed') {
-            res.status(200).json({ status: 'failed', message: jobData.error_message || 'Job processing failed.' });
+            res.status(200).json({ // Може да се обмисли 4xx/5xx HTTP статус, но 200 с success:false е често срещано
+                success: false, // За да може клиентът да го обработи като грешка
+                status: 'failed',
+                message: jobData.error_message || 'Job processing failed.',
+                jobId: jobId });
             console.log(`Job ${jobId}: Reported 'failed' status to client (from Redis). Initiating cleanup.`);
             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // Няма R2 ключ за неуспешни задачи
             return;
@@ -918,20 +1132,26 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
         if (jobData.status === 'ready' && !jobData.output_r2_key) {
             console.warn(`Job ${jobId} is 'ready' but has no 'output_r2_key'. Cleaning up as inconsistent.`);
             if (!res.headersSent) {
-                 res.status(500).json({ status: 'error', message: 'Job is in an inconsistent ready state (missing output key). Job is being cleaned up.' });
+                res.status(500).json({ success: false, status: 'error', message: 'Job is in an inconsistent ready state (missing output key). Job is being cleaned up.', jobId: jobId });
             }
             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache);
             return;
         }
 
         // Случай 6: Други статуси или неизвестно състояние
-        console.log(`Job ${jobId}: Status is '${jobData.status || 'unknown'}' and not handled by specific cases.`);
-        return res.status(200).json({ status: jobData.status || 'unknown', message: 'Job status is unknown or in an unexpected state.' });
+        // Ако стигнем дотук, значи статусът не е бил обработен от никой от горните случаи.
+        console.warn(`Job ${jobId}: Status is '${jobData.status || 'unknown'}' and not handled by specific cases. Reporting as error.`);
+        return res.status(200).json({ // Може да се обмисли 500 HTTP статус
+            success: false, // Ясно индикира проблем
+            status: 'error', // Общ статус за грешка
+            message: `Job status is '${jobData.status || 'unknown'}' which is an unhandled or unexpected state.`,
+            jobId: jobId
+        });
 
     } catch (error) { // Общ error handler за ендпойнта
         console.error(`Error processing /jobResult for ${jobId}:`, error);
         if (!res.headersSent) {
-            res.status(500).json({ status: 'error', message: 'Failed to retrieve job result due to a server error.', details: error.message });
+            res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve job result due to a server error.', details: error.message, jobId: jobId });
         }
     }
 });
