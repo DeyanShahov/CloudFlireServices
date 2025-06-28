@@ -936,6 +936,229 @@ app.post('/jobChangeOutfit', uploadOutfitImages, async (req, res) => {
     }
 });
 
+// /**
+//  * @route GET /jobResult/:jobId
+//  * @description Ендпойнт за проверка на статуса на задача и извличане на резултата (изображение).
+//  * Клиентите правят polling към този ендпойнт.
+//  * @param {string} req.params.jobId - ID на задачата.
+//  */
+// app.get('/jobResult', async (req, res) => { // Промяна: премахване на :jobId от пътя
+//     const { jobId } = req.query; // Промяна: извличане на jobId от req.query
+//     const bucketName = process.env.R2_BUCKET_NAME;
+
+//     if (!jobId) {
+//         return res.status(400).json({ error: 'jobId query parameter is required.' });
+//     }
+
+//     if (!redisClient || !redisClient.isReady) {
+//         return res.status(503).json({ error: 'Service unavailable: Redis connection error.' });
+//     }
+//     if (!bucketName) {
+//         console.error('R2_BUCKET_NAME is not set in .env for /jobResult');
+//         return res.status(500).json({ error: 'Server configuration error: Bucket name not set.' });
+//     }
+
+//     try {
+//         // При всяка заявка за резултат, активираме "работещ" режим на диспечера
+//         activateWorkingMode();
+
+//         let jobData = await redisClient.hGetAll(jobId); // Вземане на данните за задачата веднъж
+      
+//         // --- Step 1: Check local cache first ---
+//         const cachedJob = readyJobsForClientCache.get(jobId);
+
+//         if (cachedJob && cachedJob.r2Key) {
+//             console.log(`Job ${jobId}: Found in local dispatcher cache with R2 key: ${cachedJob.r2Key}. Attempting to fetch and send.`);
+//             try {
+//                 const getParams = { Bucket: bucketName, Key: cachedJob.r2Key };
+//                 const objectData = await s3Client.send(new GetObjectCommand(getParams));
+//                 const imageBody = await streamToBuffer(objectData.Body);
+//                 const base64Data = imageBody.toString('base64');
+
+//                 const finalResponse = {
+//                     success: true,
+//                     status: "completed",
+//                     //image_data_base64: base64Data,
+//                     //image_type: objectData.ContentType || "application/octet-stream"
+//                     // Клиентът очаква imageUrls да е масив с base64 data URL
+//                     imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+//                     jobId: jobId // Добавено за консистентност
+//                 };
+
+//                 res.status(200).json(finalResponse);
+//                 console.log(`Job ${jobId} (R2 Key: ${cachedJob.r2Key}) from cache successfully sent to client.`);
+//                 // Cleanup after successful send from cache
+//                 await performFullCleanup(jobId, cachedJob.r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//             } catch (fetchError) {
+//                 if (fetchError.name === 'NoSuchKey') {
+//                     console.warn(`Job ${jobId}: (From Cache) R2 object not found (NoSuchKey) for key ${cachedJob.r2Key}. Cleaning up job.`);
+//                     if (!res.headersSent) {
+//                         res.status(404).json({ status: 'error', message: `Image for job ${jobId} (key: ${cachedJob.r2Key}) not found in storage. The job record is being cleaned up.` });
+//                     }
+//                     await performFullCleanup(jobId, cachedJob.r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//                 } else {
+//                     console.error(`Job ${jobId}: (From Cache) Error fetching/processing image from R2 (Key: ${cachedJob.r2Key}):`, fetchError);
+//                     if (!res.headersSent) {
+//                         res.status(500).json({ status: 'error', message: 'Failed to retrieve image data from cache source due to storage error.', details: fetchError.message });
+//                     }
+//                     // DO NOT cleanup here for other R2 errors. Let client retry. Job stays in cache until TTL.
+//                 }
+//             }
+//             return; // Important: exit after handling cached job
+//         }
+       
+//         // --- Step 2: If not in cache, or cache entry was invalid, query Redis ---
+//         console.log(`Job ${jobId}: Not found in local cache or cache entry invalid. Querying Redis.`);
+//         jobData = await redisClient.hGetAll(jobId); // Вземане на данните за задачата от Redis
+
+//         // Case 1 (from Redis): Job not found in Redis
+//         if (!jobData || Object.keys(jobData).length === 0) {
+//            return res.status(404).json({ success: false, status: 'not_found', message: 'Job not found in Redis.', jobId: jobId });
+//         }
+
+//         // --- НОВО: Обработка на специфични междинни статуси от worker-и ---
+//         const intermediateWorkerStatuses = ['waiting_comfyui']; // Добавете други подобни статуси тук, ако е необходимо
+//         if (jobData.status && intermediateWorkerStatuses.includes(jobData.status)) {
+//             console.log(`Job ${jobId}: Detected intermediate worker status '${jobData.status}'. Responding to client as 'processing'.`);
+//             return res.status(200).json({ // Клиентът очаква 200 OK за успешни полинг отговори
+//                 success: true, // Ключово, за да може клиентът да продължи полинга
+//                 status: 'processing', // Или 'pending', клиентът обработва и двата за полинг
+//                 message: `Задачата е в междинен работен статус: ${jobData.status}. Обработката продължава.`,
+//                 jobId: jobId
+//             });
+//         }
+
+//         // --- НОВО или КОРИГИРАНО: Обработка на статус 'completed' директно от Redis ---
+//         // Този случай е нужен, ако worker-ите могат директно да зададат статус 'completed' в Redis
+//         // и това означава, че output_r2_key също трябва да е наличен.
+//         // Поставяме го преди 'ready', за да хванем 'completed' първо, ако е възможно.
+//         if (jobData.status === 'completed' && jobData.output_r2_key) {
+//             const r2Key = jobData.output_r2_key;
+//             console.log(`Job ${jobId}: Status from Redis is 'completed' with R2 key ${r2Key}. Fetching from R2.`);
+//             try {
+//                 // const getParams = { Bucket: bucketName, Key: r2Key }; // Redundant, getParams is defined below
+//                 const objectData = await s3Client.send(new GetObjectCommand({ Bucket: bucketName, Key: r2Key }));
+//                 const imageBody = await streamToBuffer(objectData.Body);
+//                 const base64Data = imageBody.toString('base64');
+
+//                 const finalResponse = {
+//                     success: true,
+//                     status: "completed", // Потвърждаваме за клиента
+//                     imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+//                     jobId: jobId
+//                 };
+//                 res.status(200).json(finalResponse);
+//                 console.log(`Job ${jobId} (R2 Key: ${r2Key}) from Redis 'completed' status successfully sent to client.`);
+//                 // Почистване след успешно изпращане
+//                 await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//                 return; // Важно е да излезем от функцията тук
+//             } catch (fetchError) {
+//                 console.error(`Job ${jobId}: (From Redis 'completed' status) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
+//                 // Връщаме грешка, но не изчистваме, за да може клиентът да опита отново или да се инспектира
+//                 res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data for completed job due to storage error.', details: fetchError.message, jobId: jobId });
+//                 return; // Важно е да излезем
+//             }
+//         }
+
+//         // Case 2 (from Redis): Job is 'ready' and has output_r2_key
+//         if (jobData.status === 'ready' && jobData.output_r2_key) { // NOSONAR
+//             const r2Key = jobData.output_r2_key; // NOSONAR
+//             console.log(`Job ${jobId}: Found in Redis as 'ready' with R2 key: ${r2Key}. Attempting to fetch and send.`);
+//             try {
+//                 const getParams = { Bucket: bucketName, Key: r2Key };
+//                 const objectData = await s3Client.send(new GetObjectCommand(getParams));
+//                 const imageBody = await streamToBuffer(objectData.Body);
+//                 const base64Data = imageBody.toString('base64');
+
+//                 const finalResponse = {
+//                     success: true, // Добавено за консистентност с очакванията на клиента
+//                     status: "completed",
+//                     //image_data_base64: base64Data,
+//                     // objectData.ContentType || "application/octet-stream" // Използване на реалния ContentType
+//                     // Клиентът очаква imageUrls да е масив с base64 data URL
+//                     imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
+//                     jobId: jobId // Добавено
+//                 };
+
+//                 res.status(200).json(finalResponse);
+//                 console.log(`Job ${jobId} (R2 Key: ${r2Key}) from Redis successfully sent to client.`);
+//                 // Почистване след успешно изпращане
+//                 await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//             } catch (fetchError) {
+//                 if (fetchError.name === 'NoSuchKey') {
+//                     console.warn(`Job ${jobId}: (From Redis) R2 object not found (NoSuchKey) for key ${r2Key}. Job status was 'ready'. Cleaning up job.`);
+//                     if (!res.headersSent) {
+//                        res.status(404).json({ success: false, status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.`, jobId: jobId });
+//                     }
+//                     // await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // r2Key е null, тъй като не е намерен
+//                 //} else {
+//                     // console.error(`Job ${jobId}: Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
+//                     await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//                 } else {
+//                     console.error(`Job ${jobId}: (From Redis) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);                  
+//                     if (!res.headersSent) {
+//                         res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message, jobId: jobId });
+//                     }
+//                     // DO NOT cleanup here for other R2 errors. Job remains 'ready' in Redis. Client can retry.
+//                     // При други грешки при извличане, може да не искаме да чистим веднага, за да позволим евентуален повторен опит или инспекция.
+//                 }
+//             }
+//             return;
+//         }
+
+//         // Case 3 (from Redis): Job is 'pending' or 'processing'
+//         if (jobData.status === 'pending' || jobData.status === 'processing') {
+//             return res.status(200).json({ // Клиентът очаква 200 OK
+//                 success: true, // Ключово
+//                 status: jobData.status,
+//                 message: 'Job is still being processed.',
+//                 jobId: jobId
+//             });
+//         }
+
+//         // Случай 4: Задачата е 'failed'
+//         if (jobData.status === 'failed') {
+//             res.status(200).json({ // Може да се обмисли 4xx/5xx HTTP статус, но 200 с success:false е често срещано
+//                 success: false, // За да може клиентът да го обработи като грешка
+//                 status: 'failed',
+//                 message: jobData.error_message || 'Job processing failed.',
+//                 jobId: jobId });
+//             console.log(`Job ${jobId}: Reported 'failed' status to client (from Redis). Initiating cleanup.`);
+//             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // Няма R2 ключ за неуспешни задачи
+//             return;
+//         }
+
+//         // Случай 5: Задачата е 'ready', но липсва output_r2_key (неконсистентно състояние)
+//         if (jobData.status === 'ready' && !jobData.output_r2_key) {
+//             console.warn(`Job ${jobId} is 'ready' but has no 'output_r2_key'. Cleaning up as inconsistent.`);
+//             if (!res.headersSent) {
+//                 res.status(500).json({ success: false, status: 'error', message: 'Job is in an inconsistent ready state (missing output key). Job is being cleaned up.', jobId: jobId });
+//             }
+//             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache);
+//             return;
+//         }
+
+//         // Случай 6: Други междинни статуси (включително 'completed' без r2_key)
+//         // Ако стигнем дотук, значи статусът е междинен и клиентът трябва да продължи да проверява.
+//         // Това възстановява логиката от старата версия, която не третираше тези статуси като грешка.
+//         const currentStatus = jobData.status || 'unknown';
+//         console.log(`Job ${jobId}: Status is '${currentStatus}'. Responding to client to continue polling.`);
+//         return res.status(200).json({
+//             success: true, // Ключово: казваме на клиента, че всичко е наред и да продължи да проверява
+//             status: currentStatus, // Връщаме текущия статус, както в старата версия
+//             message: `Job is in an intermediate state: ${currentStatus}. Please continue polling.`,
+//             jobId: jobId
+//         });
+
+//     } catch (error) { // Общ error handler за ендпойнта
+//         console.error(`Error processing /jobResult for ${jobId}:`, error);
+//         if (!res.headersSent) {
+//             res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve job result due to a server error.', details: error.message, jobId: jobId });
+//         }
+//     }
+// });
+
+
 /**
  * @route GET /jobResult/:jobId
  * @description Ендпойнт за проверка на статуса на задача и извличане на резултата (изображение).
@@ -976,13 +1199,9 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 const base64Data = imageBody.toString('base64');
 
                 const finalResponse = {
-                    success: true,
                     status: "completed",
-                    //image_data_base64: base64Data,
-                    //image_type: objectData.ContentType || "application/octet-stream"
-                    // Клиентът очаква imageUrls да е масив с base64 data URL
-                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
-                    jobId: jobId // Добавено за консистентност
+                    image_data_base64: base64Data,
+                    image_type: objectData.ContentType || "application/octet-stream"
                 };
 
                 res.status(200).json(finalResponse);
@@ -1013,51 +1232,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
 
         // Case 1 (from Redis): Job not found in Redis
         if (!jobData || Object.keys(jobData).length === 0) {
-           return res.status(404).json({ success: false, status: 'not_found', message: 'Job not found in Redis.', jobId: jobId });
-        }
-
-        // --- НОВО: Обработка на специфични междинни статуси от worker-и ---
-        const intermediateWorkerStatuses = ['waiting_comfyui']; // Добавете други подобни статуси тук, ако е необходимо
-        if (jobData.status && intermediateWorkerStatuses.includes(jobData.status)) {
-            console.log(`Job ${jobId}: Detected intermediate worker status '${jobData.status}'. Responding to client as 'processing'.`);
-            return res.status(200).json({ // Клиентът очаква 200 OK за успешни полинг отговори
-                success: true, // Ключово, за да може клиентът да продължи полинга
-                status: 'processing', // Или 'pending', клиентът обработва и двата за полинг
-                message: `Задачата е в междинен работен статус: ${jobData.status}. Обработката продължава.`,
-                jobId: jobId
-            });
-        }
-
-        // --- НОВО или КОРИГИРАНО: Обработка на статус 'completed' директно от Redis ---
-        // Този случай е нужен, ако worker-ите могат директно да зададат статус 'completed' в Redis
-        // и това означава, че output_r2_key също трябва да е наличен.
-        // Поставяме го преди 'ready', за да хванем 'completed' първо, ако е възможно.
-        if (jobData.status === 'completed' && jobData.output_r2_key) {
-            const r2Key = jobData.output_r2_key;
-            console.log(`Job ${jobId}: Status from Redis is 'completed' with R2 key ${r2Key}. Fetching from R2.`);
-            try {
-                // const getParams = { Bucket: bucketName, Key: r2Key }; // Redundant, getParams is defined below
-                const objectData = await s3Client.send(new GetObjectCommand({ Bucket: bucketName, Key: r2Key }));
-                const imageBody = await streamToBuffer(objectData.Body);
-                const base64Data = imageBody.toString('base64');
-
-                const finalResponse = {
-                    success: true,
-                    status: "completed", // Потвърждаваме за клиента
-                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
-                    jobId: jobId
-                };
-                res.status(200).json(finalResponse);
-                console.log(`Job ${jobId} (R2 Key: ${r2Key}) from Redis 'completed' status successfully sent to client.`);
-                // Почистване след успешно изпращане
-                await performFullCleanup(jobId, r2Key, bucketName, redisClient, s3Client, readyJobsForClientCache);
-                return; // Важно е да излезем от функцията тук
-            } catch (fetchError) {
-                console.error(`Job ${jobId}: (From Redis 'completed' status) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);
-                // Връщаме грешка, но не изчистваме, за да може клиентът да опита отново или да се инспектира
-                res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data for completed job due to storage error.', details: fetchError.message, jobId: jobId });
-                return; // Важно е да излезем
-            }
+            return res.status(404).json({ status: 'not_found', message: 'Job not found in Redis.' });
         }
 
         // Case 2 (from Redis): Job is 'ready' and has output_r2_key
@@ -1071,13 +1246,9 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 const base64Data = imageBody.toString('base64');
 
                 const finalResponse = {
-                    success: true, // Добавено за консистентност с очакванията на клиента
                     status: "completed",
-                    //image_data_base64: base64Data,
-                    // objectData.ContentType || "application/octet-stream" // Използване на реалния ContentType
-                    // Клиентът очаква imageUrls да е масив с base64 data URL
-                    imageUrls: [`data:${objectData.ContentType || 'application/octet-stream'};base64,${base64Data}`],
-                    jobId: jobId // Добавено
+                    image_data_base64: base64Data,
+                    image_type: objectData.ContentType || "application/octet-stream" // Използване на реалния ContentType
                 };
 
                 res.status(200).json(finalResponse);
@@ -1088,7 +1259,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 if (fetchError.name === 'NoSuchKey') {
                     console.warn(`Job ${jobId}: (From Redis) R2 object not found (NoSuchKey) for key ${r2Key}. Job status was 'ready'. Cleaning up job.`);
                     if (!res.headersSent) {
-                       res.status(404).json({ success: false, status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.`, jobId: jobId });
+                        res.status(404).json({ status: 'error', message: `Image for job ${jobId} (key: ${r2Key}) not found in storage. The job record is being cleaned up.` });
                     }
                     // await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // r2Key е null, тъй като не е намерен
                 //} else {
@@ -1097,7 +1268,7 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
                 } else {
                     console.error(`Job ${jobId}: (From Redis) Error fetching/processing image from R2 (Key: ${r2Key}):`, fetchError);                  
                     if (!res.headersSent) {
-                        res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message, jobId: jobId });
+                        res.status(500).json({ status: 'error', message: 'Failed to retrieve image data from Redis source due to storage error.', details: fetchError.message });
                     }
                     // DO NOT cleanup here for other R2 errors. Job remains 'ready' in Redis. Client can retry.
                     // При други грешки при извличане, може да не искаме да чистим веднага, за да позволим евентуален повторен опит или инспекция.
@@ -1108,21 +1279,12 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
 
         // Case 3 (from Redis): Job is 'pending' or 'processing'
         if (jobData.status === 'pending' || jobData.status === 'processing') {
-            return res.status(200).json({ // Клиентът очаква 200 OK
-                success: true, // Ключово
-                status: jobData.status,
-                message: 'Job is still being processed.',
-                jobId: jobId
-            });
+            return res.status(202).json({ status: jobData.status, message: 'Job is still being processed.' });
         }
 
         // Случай 4: Задачата е 'failed'
         if (jobData.status === 'failed') {
-            res.status(200).json({ // Може да се обмисли 4xx/5xx HTTP статус, но 200 с success:false е често срещано
-                success: false, // За да може клиентът да го обработи като грешка
-                status: 'failed',
-                message: jobData.error_message || 'Job processing failed.',
-                jobId: jobId });
+            res.status(200).json({ status: 'failed', message: jobData.error_message || 'Job processing failed.' });
             console.log(`Job ${jobId}: Reported 'failed' status to client (from Redis). Initiating cleanup.`);
             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache); // Няма R2 ключ за неуспешни задачи
             return;
@@ -1132,26 +1294,20 @@ app.get('/jobResult', async (req, res) => { // Промяна: премахва�
         if (jobData.status === 'ready' && !jobData.output_r2_key) {
             console.warn(`Job ${jobId} is 'ready' but has no 'output_r2_key'. Cleaning up as inconsistent.`);
             if (!res.headersSent) {
-                res.status(500).json({ success: false, status: 'error', message: 'Job is in an inconsistent ready state (missing output key). Job is being cleaned up.', jobId: jobId });
+                 res.status(500).json({ status: 'error', message: 'Job is in an inconsistent ready state (missing output key). Job is being cleaned up.' });
             }
             await performFullCleanup(jobId, null, bucketName, redisClient, s3Client, readyJobsForClientCache);
             return;
         }
 
         // Случай 6: Други статуси или неизвестно състояние
-        // Ако стигнем дотук, значи статусът не е бил обработен от никой от горните случаи.
-        console.warn(`Job ${jobId}: Status is '${jobData.status || 'unknown'}' and not handled by specific cases. Reporting as error.`);
-        return res.status(200).json({ // Може да се обмисли 500 HTTP статус
-            success: false, // Ясно индикира проблем
-            status: 'error', // Общ статус за грешка
-            message: `Job status is '${jobData.status || 'unknown'}' which is an unhandled or unexpected state.`,
-            jobId: jobId
-        });
+        console.log(`Job ${jobId}: Status is '${jobData.status || 'unknown'}' and not handled by specific cases.`);
+        return res.status(200).json({ status: jobData.status || 'unknown', message: 'Job status is unknown or in an unexpected state.' });
 
     } catch (error) { // Общ error handler за ендпойнта
         console.error(`Error processing /jobResult for ${jobId}:`, error);
         if (!res.headersSent) {
-            res.status(500).json({ success: false, status: 'error', message: 'Failed to retrieve job result due to a server error.', details: error.message, jobId: jobId });
+            res.status(500).json({ status: 'error', message: 'Failed to retrieve job result due to a server error.', details: error.message });
         }
     }
 });
